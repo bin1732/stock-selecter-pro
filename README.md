@@ -88,6 +88,3 @@ MIT License — see [LICENSE](LICENSE) for details.
 >
 > 风险声明：以上为技术形态与基本面筛选结果，不构成投资建议。股市有风险，投资需谨慎。
 
-> ⚠️ **This repository is an open-source placeholder version. Future versions will be closed-source.**
->
-> 本仓库为开源占位版本，后续版本将闭源。
