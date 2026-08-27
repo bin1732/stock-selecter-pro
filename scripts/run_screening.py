@@ -1,5 +1,5 @@
 """
-stock-selecter-pro v1.0.3 选股筛选主入口。
+stock-selecter-pro v1.0.4 选股筛选主入口。
 
 集成：批量并发K线获取 → 多策略并行判定 → 组合引擎 → HTML/Text/JSON报告生成。
 
@@ -68,29 +68,19 @@ def _set_guide_done():
             pass
 
 
-# ── 数据层 ──
-from data.a_share import (
+# ── 数据层（统一从 data 包导入，与 data/__init__.py 公共导出一致）──
+from data import (
     fetch_top_a_share_codes,
     fetch_batch_klines_parallel,
     fetch_weekly_kline,
-)
-from data.fundamental import (
     fetch_fundamental_batch,
     fetch_valuation,
-)
-from data.money_flow import (
     fetch_stock_money_flow,
-)
-from data.sector import (
     fetch_industry_ranking,
     fetch_concept_ranking,
-)
-from data.hk_share import (
     fetch_all_hk_codes,
     fetch_hk_batch_klines,
     fetch_hk_weekly_kline,
-)
-from data.us_share import (
     fetch_all_us_codes,
     fetch_us_batch_klines,
 )
@@ -201,7 +191,7 @@ def _fetch_market_breadth(market: str) -> Optional[dict]:
 
     up = down = flat = 0
     page = 1
-    while True:
+    while page <= config.ENV_BREADTH_MAX_PAGES:
         data = push2_get("/api/qt/clist/get", params={
             "pn": str(page), "pz": "1000", "po": "1", "np": "1",
             "fltt": "2", "invt": "2",
@@ -259,6 +249,16 @@ def _assess_market_environment(market: str = config.DEFAULT_MARKET) -> dict:
     Returns:
         dict: {environment, factor, detail, indices, signals, breadth}
     """
+    # 当日缓存（仅"收盘后当日"有效）：命中条件为缓存包含今日完整K线
+    # （_kline_date == 今日，收盘后写入）——指数数据当日收盘后定型，当日重复
+    # 提问复用合理；盘中/跨天/周末写入的缓存不命中，重新拉取实时数据，
+    # 保证大盘环境实时准确（不为提速牺牲实时性）。
+    env_cache = KlineCacheManager()
+    cached_env = env_cache.get(f"env:{market}", 1)
+    if cached_env is not None and cached_env.get("_kline_date") == datetime.now().strftime("%Y-%m-%d"):
+        cached_env.pop("_kline_date", None)  # 内部字段不进入报告输出
+        return cached_env
+
     indices_cfg = config.INDEX_SECIDS.get(market, {})
     env = {
         "environment": "未知",
@@ -273,12 +273,14 @@ def _assess_market_environment(market: str = config.DEFAULT_MARKET) -> dict:
     bearish_count = 0
     total_signals = 0
     details = []
+    env_kline_dates: list[str] = []  # 指数K线最后日期（缓存时效判断用）
 
     for code, (name, mkt) in indices_cfg.items():
         klines = _fetch_index_klines(mkt, code, config.INDEX_KLINE_DAYS)
         if len(klines) < 20:
             details.append(f"{name}: K线数据不足")
             continue
+        env_kline_dates.append(klines[-1]["date"])
 
         closes = [k["close"] for k in klines]
         amounts = [k.get("amount") or 0 for k in klines]
@@ -386,6 +388,15 @@ def _assess_market_environment(market: str = config.DEFAULT_MARKET) -> dict:
         env["environment"] = "震荡"
         env["factor"] = config.MARKET_OSCILLATE_COEFFICIENT
 
+    # 写入当日缓存：记录指数K线最后日期（_kline_date），仅"收盘后当日"缓存可命中
+    if env_kline_dates:
+        env["_kline_date"] = max(env_kline_dates)
+    try:
+        env_cache.set(f"env:{market}", 1, env)
+    except Exception:
+        pass  # 缓存写入失败不阻塞
+
+    env.pop("_kline_date", None)  # 内部字段不进入报告输出
     return env
 
 
@@ -406,9 +417,9 @@ def _build_single_market_pool(market: str, mode: str, cap: int) -> list[dict]:
     """
     if market == config.MARKET_A:
         print(f"  获取A股候选池（按总市值降序前 {cap} 只）...")
-        # 市值降序候选池（与港股/美股口径一致）：
-        # 替代按当日涨跌幅(f3)排序取前N —— 原实现只覆盖当日涨幅最大的股票，
-        # 系统性漏掉回调/横盘/低位等大量符合技术形态的标的，导致结果失真
+        # 市值降序候选池（与港股/美股口径一致）：按总市值排序取前N，
+        # 避免按当日涨跌幅排序导致只覆盖当日涨幅最大的股票，系统性漏掉
+        # 回调/横盘/低位等大量符合技术形态的标的
         filtered = fetch_top_a_share_codes(cap=cap)
         for s in filtered:
             s["market"] = config.MARKET_A
@@ -532,7 +543,7 @@ def _fetch_klines_by_market(candidates: list[dict], cache_mgr, days: int) -> dic
                             cache_mgr.set(f"{mkt}:{code}", days, kls)
 
             results.update(batch_results)
-            valid_count = sum(1 for kls in batch_results.values() if len(kls) >= 20)
+            valid_count = sum(1 for kls in batch_results.values() if len(kls) >= config.VALID_KLINE_MIN)
             print(f"    本批有效: {valid_count}/{len(batch_results)}")
     return results
 
@@ -572,12 +583,13 @@ def _fetch_weekly_by_market(by_market_codes: dict[str, list[str]]) -> dict[str, 
 def _fetch_fundamental_by_market(
     candidates: list[dict],
     strategy_ids: Optional[list[str]] = None,
+    no_cache: bool = False,
 ) -> dict[str, dict]:
     """按市场获取基本面/估值数据（按策略依赖裁剪，未启用对应策略则跳过，避免无谓请求）。
 
     - A股：财务摘要（S12/S13/S14 需要）+ 估值（S06/S07 需要）
-    - 港股/美股：仅估值（push2 接口返回 PE/PB/股息率/总市值，
-      财务摘要无公开数据源，如实缺省 → S12/S13/S14 判定不通过）
+    - 港股/美股：财务摘要（GMAININDICATOR 报表，三市场字段同构，真实返回）
+      + 估值（候选池 clist 字段，三市场真实返回）
 
     估值来源：
     - 优先使用候选池 clist 批量字段（f9 动态PE / f23 PB / f133 股息率，
@@ -606,8 +618,8 @@ def _fetch_fundamental_by_market(
         if any(v not in (None, 0.0) for v in (pe, pb, dy)):
             pool_valuation[s["code"]] = {
                 "code": s["code"],
-                # clist f9 为动态PE（push2 f162 为TTM PE，口径不同但同为真实估值；
-                # 策略 PE 阈值为绝对值过滤，差异可接受，报告如实标注来源）
+                # clist f9 与 push2 f162（TTM PE）多标的核验数值一致（12/12 全样本），
+                # 口径统一为东财 PE 字段；策略 PE 阈值为绝对值过滤，报告如实标注来源）
                 "pe_ttm": None if pe in (None, 0.0) else pe,
                 "pb": None if pb in (None, 0.0) else pb,
                 "dividend_yield": None if dy in (None, 0.0) else dy,
@@ -630,61 +642,72 @@ def _fetch_fundamental_by_market(
                     need_financial=need_financial,
                     need_valuation=need_valuation,
                     pool_valuation=pool_valuation,
+                    use_cache=not no_cache,
                 )
             )
         else:
-            if not need_valuation:
-                print(f"  无需{mkt}估值数据（未启用 S06/S07），跳过")
+            if not need_financial and not need_valuation:
+                print(f"  无需{mkt}基本面/估值数据（未启用 S06/S07/S12/S13/S14），跳过")
                 continue
-            missing = [s["code"] for s in stocks if s["code"] not in pool_valuation]
-            for s in stocks:
-                if s["code"] in pool_valuation:
-                    result[s["code"]] = pool_valuation[s["code"]]
-            print(f"  获取{mkt}估值数据 ({len(codes)} 只, 候选池覆盖 {len(codes) - len(missing)} 只)")
-            if missing:
-                def _fetch_one(code: str):
-                    val = fetch_valuation(code, market=mkt)
-                    val["code"] = code
-                    return code, val
-
-                with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_WORKERS) as ex:
-                    futures = {ex.submit(_fetch_one, c): c for c in missing}
-                    for future in as_completed(futures):
-                        code, val = future.result()
-                        result[code] = val
+            tag = ("财务摘要+估值" if need_financial and need_valuation
+                   else ("财务摘要" if need_financial else "估值"))
+            print(f"  获取{mkt}{tag}数据 ({len(codes)} 只, 估值用候选池字段)...")
+            # 港股/美股与 A股统一走 fetch_fundamental_batch：
+            # 财务摘要走 GMAININDICATOR（三市场字段同构），估值优先候选池 clist 字段
+            result.update(
+                fetch_fundamental_batch(
+                    codes,
+                    max_workers=config.MAX_CONCURRENT_WORKERS,
+                    market=mkt,
+                    need_financial=need_financial,
+                    need_valuation=need_valuation,
+                    pool_valuation=pool_valuation,
+                    use_cache=not no_cache,
+                )
+            )
     return result
 
 
-def _fetch_a_share_money_flow(
-    a_codes: list[str],
+def _fetch_money_flow_by_market(
+    candidates: list[dict],
     strategy_ids: list[str],
+    use_cache: bool = True,
 ) -> dict[str, list]:
-    """获取A股资金流数据（抽样并发；仅 S15 依赖资金流，未启用则跳过）。
+    """按市场获取资金流数据（抽样并发；仅 S15 依赖资金流，未启用则跳过）。
 
-    港股/美股无对应公开数据源，如实不获取。
+    数据可用性：
+    - A股/港股：push2 fflow 接口真实返回逐日主力资金流（港股 secid 116.xxx）
+    - 美股：公开接口无对应口径（105.AAPL 无数据），如实不获取
     """
     money_flow_data = {}
-    if not a_codes:
+    if not candidates:
         return money_flow_data
     if not (set(strategy_ids) & config.MONEY_FLOW_STRATEGIES):
         print("  无需资金流数据（未启用 S15），跳过")
         return money_flow_data
 
-    sample_codes = a_codes[:config.MONEY_FLOW_SAMPLE]
-    print(f"  获取A股资金流数据 (抽样 {len(sample_codes)} 只, 并发)...")
+    by_market = {}
+    for s in candidates:
+        by_market.setdefault(s["market"], []).append(s["code"])
+    for mkt, codes in by_market.items():
+        if mkt == config.MARKET_US:
+            # 美股无对应公开资金流口径，如实跳过
+            continue
+        sample_codes = codes[:config.MONEY_FLOW_SAMPLE]
+        print(f"  获取{mkt}资金流数据 (抽样 {len(sample_codes)} 只, 并发)...")
 
-    def _fetch_one(code: str):
-        try:
-            return code, fetch_stock_money_flow(code)
-        except Exception:
-            # 资金流接口异常：该股如实降级为空数据，相关策略自动判不通过（不伪造）
-            return code, []
+        def _fetch_one(code: str):
+            try:
+                return code, fetch_stock_money_flow(code, market=mkt, use_cache=use_cache)
+            except Exception:
+                # 资金流接口异常：该股如实降级为空数据，相关策略自动判不通过（不伪造）
+                return code, []
 
-    with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_WORKERS) as ex:
-        futures = {ex.submit(_fetch_one, c): c for c in sample_codes}
-        for future in as_completed(futures):
-            code, mf = future.result()
-            money_flow_data[code] = mf
+        with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_WORKERS) as ex:
+            futures = {ex.submit(_fetch_one, c): c for c in sample_codes}
+            for future in as_completed(futures):
+                code, mf = future.result()
+                money_flow_data[code] = mf
     return money_flow_data
 
 
@@ -694,37 +717,37 @@ def _warn_strategy_applicability(market: str, strategy_ids: list[str]):
     真实边界（config 中声明）：
     - 估值类 S06/S07：估值字段（候选池 clist f9/f23/f133，三市场可靠；
       缺失标的回退 push2 stock/get）对 A股/港股/美股 均真实返回 → 三市场可用
-    - 财务摘要类 S12/S13/S14：emweb 接口仅 A股 → 港股/美股无公开数据，自动不通过
-    - 资金流辅助类 S15：资金流数据仅 A股可获取；港股/美股资金流辅助条件不可用，
-      但 S15 核心判定为技术面（长期低位+横盘蓄力），无资金流时仍如实判定、可独立通过
+    - 财务摘要类 S07/S12/S13/S14：A股走 RPT_F10_FINANCE_MAINFINADATA，
+      港股/美股走 GMAININDICATOR 报表（港股 75 字段、美股 49 字段，
+      字段语义同构）→ 三市场财务策略均真实可用
+    - 资金流辅助类 S15：A股/港股主力资金日级数据可获取（push2 fflow 真实返回）；
+      美股无对应公开口径，该辅助条件不可用，但 S15 核心判定为技术面
+      （长期低位+横盘蓄力），无资金流时仍如实判定、可独立通过
     """
     if market == config.MARKET_A:
         return
 
     selected = set(strategy_ids)
-    # S12/S13/S14 财务摘要无公开数据 → 自动不通过；
-    # S15 仅资金流辅助条件不可用（技术面核心条件仍如实判定，不夸大影响）
-    lacking = sorted(selected & config.FINANCIAL_STRATEGIES)
     mf_lacking = sorted(selected & config.MONEY_FLOW_STRATEGIES)
     usable_val = sorted(selected & config.VALUATION_STRATEGIES)
 
     if market == config.MARKET_ALL:
-        print("  [提示] 全部市场模式下：港股/美股标的的估值策略(S06/S07)可用（真实估值接口三市场返回），")
-        print("         财务摘要(S12/S13/S14)无公开数据自动不通过；"
-              "S15(长期蓄力)的资金流辅助条件不可用，技术面核心条件仍如实判定。")
+        print("  [提示] 全部市场模式下：估值策略 S06(高股息)/S07(低估值) 与财务策略 S12/S13/S14 三市场真实可用；")
+        print("         S15(长期蓄力)在美股的资金流辅助条件不可用（美股无对应公开口径），"
+              "技术面核心条件仍按实际数据判定。")
         return
 
     notes = []
     if usable_val:
-        notes.append(f"估值策略 {', '.join(usable_val)} 可用（真实估值字段三市场返回）")
-    if lacking:
-        notes.append(f"策略 {', '.join(lacking)} 无公开数据，将自动不通过（真实缺数据，不伪造）")
+        notes.append(f"估值策略 {', '.join(usable_val)} 港股/美股可用（真实估值字段三市场返回）")
+    fin = sorted(selected & config.FINANCIAL_STRATEGIES)
+    if fin:
+        notes.append(f"财务策略 {', '.join(fin)} 港股/美股可用（GMAININDICATOR 报表真实返回）")
     if mf_lacking:
-        notes.append(f"策略 {', '.join(mf_lacking)} 的资金流辅助条件不可用（技术面核心条件仍如实判定）")
+        notes.append(f"策略 {', '.join(mf_lacking)} 的资金流辅助条件在美股不可用（无对应公开口径；"
+                     "港股可用，技术面核心条件仍按实际数据判定）")
     if notes:
         print(f"  [提示] {market}：" + "；".join(notes))
-        if lacking:
-            print("         建议港股/美股仅使用技术面策略 S01-S05、S08-S11、S15、S16-S17 与估值策略 S06/S07。")
 
 
 # ============================================================
@@ -777,8 +800,7 @@ def _run_strategies(
         if res.get("passed")
     ]
 
-    # 聚合命中策略的判定理由（去重、截断），供文本/HTML报告展示"为什么入选"；
-    # 此前该字段缺失导致报告永远读不到任何理由。
+    # 聚合命中策略的判定理由（去重、截断），供文本/HTML报告展示"为什么入选"
     reasons: list[str] = []
     for sid in strategy_hits:
         for reason in strategy_results.get(sid, {}).get("reasons", []):
@@ -914,7 +936,7 @@ def run_pipeline(
     klines_start = time.time()
     klines_data = _fetch_klines_by_market(candidates, cache_mgr, config.KLINE_DAYS)
     elapsed_klines = time.time() - klines_start
-    valid_codes = [c for c in codes if c in klines_data and len(klines_data[c]) >= 20]
+    valid_codes = [c for c in codes if c in klines_data and len(klines_data[c]) >= config.VALID_KLINE_MIN]
     print(f"  K线获取完成: {len(valid_codes)}/{len(codes)} 只有效, 耗时 {elapsed_klines:.1f}s")
 
     # 如实记录K线实际数据通道（东财 push2his / 腾讯备选通道），随报告展示
@@ -958,9 +980,8 @@ def run_pipeline(
     # 基本面/估值：A股全量（财务摘要+估值），港股/美股仅估值（S06/S07 真实可用）；
     # 资金流仅A股可获取；港股/美股标的如实使用空数据（策略内部判定为不通过）
     valid_candidates = [s for s in candidates if s["code"] in valid_codes]
-    fundamental_data = _fetch_fundamental_by_market(valid_candidates, strategy_ids)
-    a_codes = [c for c in valid_codes if code_market_map.get(c) == config.MARKET_A]
-    money_flow_data = _fetch_a_share_money_flow(a_codes, strategy_ids)
+    fundamental_data = _fetch_fundamental_by_market(valid_candidates, strategy_ids, no_cache=no_cache)
+    money_flow_data = _fetch_money_flow_by_market(valid_candidates, strategy_ids, use_cache=not no_cache)
 
     strategy_start = time.time()
     all_results = []
@@ -987,6 +1008,28 @@ def run_pipeline(
         result["recent_pcts"] = [k.get("pct_chg", 0) for k in klines[-20:]]
         result["industry"] = "未知"
         result["market"] = mkt
+
+        # 多因子画像：各策略维度得分概览（让结果可解释——"为什么入选/差在哪"）。
+        # 仅保留有得分的策略（score>0），如实来源于策略判定结果，非新增数据。
+        profile = {
+            sid: round(res.get("score", 0), 1)
+            for sid, res in result.get("strategy_results", {}).items()
+            if res.get("score", 0) > 0
+        }
+        result["factor_profile"] = profile
+
+        # 支撑/压力位：基于近60日真实K线高低点（简单技术位，如实标注口径，
+        # 非预测承诺）。K线不足60根时取全部可用区间。
+        if len(klines) >= 2:
+            window = klines[-60:] if len(klines) > 60 else klines
+            result["support_resistance"] = {
+                "support": round(min(k["low"] for k in window), 2),
+                "resistance": round(max(k["high"] for k in window), 2),
+                "window": len(window),
+            }
+        else:
+            result["support_resistance"] = None
+
         # 供档案追踪回填快照价使用（策略详情未记录收盘价时的回退值）
         result["latest_close"] = klines[-1]["close"] if klines else 0
         return result
@@ -1017,7 +1060,8 @@ def run_pipeline(
     # 组合判定已在单股维度通过 compose() 完成，此处按通过状态过滤并排序
     final_results = [r for r in all_results if r.get("passed")]
     passed_total = len(final_results)  # 截断前的真实通过总数（报告如实标注）
-    final_results.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
+    # 按综合评分降序 + 代码升序（次键保证并列分数时排序确定，同参数两次运行结果一致）
+    final_results.sort(key=lambda x: (-x.get("composite_score", 0), x.get("code", "")))
     final_results = final_results[: top_n]
     print(f"  组合模式: {strategy_mode} | 通过: {len(final_results)} 只")
 
@@ -1099,6 +1143,30 @@ def run_pipeline(
             "passed": hit_count,
             "total": len(all_results),
         }
+
+    # ── 数据质量标注（真实偏差显式量化：候选池覆盖率 / 财务滞后 / 估值口径）──
+    dq = {"candidate_coverage": {}, "financial_lag_days": None,
+          "financial_latest_report": None, "valuation_note": None}
+    try:
+        from data import fetch_market_total
+        for m in markets:
+            total = fetch_market_total(m)
+            sampled = sum(1 for s in candidates if s.get("market") == m)
+            dq["candidate_coverage"][m] = {"total": total, "sampled": sampled}
+    except Exception:
+        pass  # 覆盖率查询失败如实置空，不阻塞主流程
+    fin_dates = [f.get("report_date") for f in fundamental_data.values() if f.get("report_date")]
+    if fin_dates:
+        latest_rd = max(fin_dates)
+        dq["financial_latest_report"] = latest_rd
+        try:
+            dq["financial_lag_days"] = (datetime.now()
+                                        - datetime.strptime(latest_rd, "%Y-%m-%d")).days
+        except ValueError:
+            pass
+    dq["valuation_note"] = ("候选池估值取自 clist 字段（PE(f9)/PB(f23)/股息率(f133)），"
+                            "PE 为东财统一口径，与 TTM 口径字段（push2 f162）数值一致")
+    market_env["data_quality"] = dq
 
     # Text 报告
     if output_format in ("text", "all"):
@@ -1214,8 +1282,8 @@ def _quick_prompt(args):
         sys.exit(0)
     if choice == "5":
         args.market = config.MARKET_ALL
-        args.all_cap = 500
-        print("  已选择: 全部市场（每市场取样500只）")
+        args.all_cap = config.ALL_MARKET_SAMPLE_CAP_LARGE
+        print(f"  已选择: 全部市场（每市场取样{config.ALL_MARKET_SAMPLE_CAP_LARGE}只）")
         return
     market_map = {"1": config.MARKET_A, "2": config.MARKET_HK,
                   "3": config.MARKET_US, "4": config.MARKET_ALL}
@@ -1242,9 +1310,27 @@ def main():
         """,
     )
 
+    def _normalize_market(value: str) -> str:
+        """市场名别名归一化（人性化：与 guide 交互一致，支持 全选/all/US/HK 等别名）。"""
+        alias = {
+            "a股": config.MARKET_A, "a": config.MARKET_A, "沪深": config.MARKET_A,
+            "国内": config.MARKET_A,
+            "港股": config.MARKET_HK, "hk": config.MARKET_HK, "香港": config.MARKET_HK,
+            "美股": config.MARKET_US, "us": config.MARKET_US, "美国": config.MARKET_US,
+            "纳斯达克": config.MARKET_US, "纽交所": config.MARKET_US,
+            "全部": config.MARKET_ALL, "全选": config.MARKET_ALL, "all": config.MARKET_ALL,
+            "所有市场": config.MARKET_ALL,
+        }
+        v = str(value).strip().lower()
+        if v in alias:
+            return alias[v]
+        raise argparse.ArgumentTypeError(
+            f"未知市场: {value}（支持: A股/港股/美股/全部 及别名 全选/all/US/HK 等）"
+        )
+
     parser.add_argument("--market", default=None,
-                        choices=config.SUPPORTED_MARKETS,
-                        help="目标市场: A股/港股/美股/全部 (默认: A股)")
+                        type=_normalize_market,
+                        help="目标市场: A股/港股/美股/全部（支持别名 全选/all/US/HK 等；默认: A股)")
     parser.add_argument("--mode", default=config.SCREEN_MODE,
                         choices=["full"],
                         help="筛选范围: full=全市场候选 (默认: %(default)s)")
@@ -1255,6 +1341,9 @@ def main():
                         help="策略组合模式 (默认: %(default)s)")
     parser.add_argument("--weights", default=None,
                         help="权重配置，格式: s01=0.2,s05=0.3 (仅weighted模式)")
+    parser.add_argument("--auto-weights", action="store_true", default=None,
+                        help="自进化权重：基于档案库真实历史表现（1月胜率+1月均收益，样本充足才参与）"
+                             "自动生成加权模式权重；样本不足的策略保持默认权重（仅weighted模式生效）")
     parser.add_argument("--multi-period", action="store_true",
                         help="启用多周期验证 (日+周线确认; 美股无周线自动跳过)")
     parser.add_argument("--output", default=None,
@@ -1278,6 +1367,8 @@ def main():
                         help="仅生成档案报告（不执行筛选，与 --track 互斥）")
     parser.add_argument("--backtest", action="store_true", default=None,
                         help="筛选后执行策略历史回测（真实K线信号回放，输出真实胜率与平均收益）")
+    parser.add_argument("--quick", action="store_true", default=None,
+                        help="快速模式：候选池上限200、输出前20、文本报告（大幅缩短耗时，适合快速预览）")
     parser.add_argument("--all-cap", type=int, default=None,
                         help="\"全部\"市场模式下每市场取样上限 (默认: 200；放大可覆盖更多标的，耗时增加)")
     parser.add_argument("--cap", type=int, default=None,
@@ -1297,6 +1388,12 @@ def main():
     # ── 参数合法性校验 ──
     if args.top is not None and args.top <= 0:
         print("错误: --top 必须为正整数")
+        return
+    if args.cap is not None and args.cap <= 0:
+        print("错误: --cap 必须为正整数")
+        return
+    if args.all_cap is not None and args.all_cap <= 0:
+        print("错误: --all-cap 必须为正整数")
         return
 
     # ── 独立档案报告模式 ──
@@ -1341,6 +1438,18 @@ def main():
     # ── 每次运行的轻量市场询问（非首次用户，交互终端下）──
     if not should_guide:
         _quick_prompt(args)
+
+    # ── 快速模式：候选池缩小 + 输出精简（仅当用户未显式覆盖时生效）──
+    if args.quick:
+        if args.cap is None:
+            args.cap = config.QUICK_CAP
+        if args.all_cap is None:
+            args.all_cap = config.QUICK_CAP
+        if args.top == config.TOP_N_OUTPUT:
+            args.top = 20
+        if args.format == "all":
+            args.format = "text"
+        print(f"  快速模式: 候选池每市场 {config.QUICK_CAP} 只，输出前 20，文本报告")
 
     output_dir = args.output or config.OUTPUT_DIR
 
@@ -1394,6 +1503,29 @@ def main():
         if not weights:
             print("  警告: 未解析到有效权重，回退为默认等权")
             weights = None
+
+    # 自进化权重（--auto-weights）：基于档案库真实历史表现生成加权权重
+    if args.auto_weights:
+        if args.strategy_mode != "weighted":
+            print("  提示: --auto-weights 仅对 weighted 模式生效（当前模式为 "
+                  f"{args.strategy_mode}），已忽略")
+        elif weights is not None:
+            print("  提示: --auto-weights 与 --weights 同时指定，以 --weights 为准")
+        else:
+            from archive.analytics import suggest_weights
+            from archive import refresh_strategy_stats
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   config.ARCHIVE_DB_PATH)
+            if os.path.exists(db_path):
+                # 先刷新策略统计（聚合最新 pick_performance），再基于真实数据生成权重
+                refresh_strategy_stats(db_path)
+            weights, note = suggest_weights(
+                db_path,
+                config.STRATEGY_DEFAULT_WEIGHTS,
+                min_picks=config.AUTO_WEIGHTS_MIN_PICKS,
+            )
+            print(f"  [自进化] {note}")
+            print(f"  [自进化] 加权权重已更新为档案库数据驱动（--auto-weights）")
 
     print("=" * 70)
     print(f"   stock-selecter-pro {config.VERSION} 多策略量化选股")

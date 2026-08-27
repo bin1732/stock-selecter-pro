@@ -14,7 +14,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-from ._http import push2_get, kline_get, safe_float  # 东财实时/历史接口共享客户端（多节点故障切换）
+from ._http import push2_get, kline_get, safe_float, parse_kline_csv  # 东财实时/历史接口共享客户端（多节点故障切换）
 
 
 def _market_code(code: str) -> str:
@@ -39,9 +39,8 @@ def fetch_top_a_share_codes(cap: int = 1000) -> list[dict]:
     """按总市值降序获取A股候选池（过滤 ST/退市/新股后取前 cap 只）。
 
     与港股/美股列表口径一致：fid=f20（总市值）降序分页取前N近似，
-    替代此前 fid=f3（当日涨跌幅）排序取前N造成的候选池偏倚——
-    原实现候选池只覆盖当日涨幅最大的股票，会系统性漏掉回调/横盘等
-    大量符合技术形态的标的，导致筛选结果失真。
+    按市值排序而非当日涨跌幅排序，避免候选池只覆盖当日涨幅大的标的
+    而系统性漏掉回调/横盘等大量符合技术形态的标的。
 
     Returns:
         list[dict]: [{code, name, market, industry}, ...]（market 为 sh/sz/bj 标签；
@@ -130,24 +129,7 @@ def fetch_daily_kline(
     klines = data.get("data", {}).get("klines", [])
     if not klines:
         return []
-
-    result = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) < 11:
-            continue
-        result.append({
-            "date": parts[0],
-            "open": round(safe_float(parts[1]), 2),
-            "close": round(safe_float(parts[2]), 2),
-            "high": round(safe_float(parts[3]), 2),
-            "low": round(safe_float(parts[4]), 2),
-            "volume": int(safe_float(parts[5])),
-            "amount": round(safe_float(parts[6]), 2),
-            "pct_chg": safe_float(parts[8]),
-            "turnover": safe_float(parts[10]),
-        })
-    return result
+    return parse_kline_csv(klines, include_turnover=True)
 
 
 def fetch_batch_klines_parallel(
@@ -199,18 +181,4 @@ def fetch_weekly_kline(code: str, weeks: int = 60) -> list[dict]:
         return []
 
     klines = data.get("data", {}).get("klines", [])
-    result = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) < 11:
-            continue
-        result.append({
-            "date": parts[0],
-            "open": round(safe_float(parts[1]), 2),
-            "close": round(safe_float(parts[2]), 2),
-            "high": round(safe_float(parts[3]), 2),
-            "low": round(safe_float(parts[4]), 2),
-            "volume": int(safe_float(parts[5])),
-            "amount": round(safe_float(parts[6]), 2),
-        })
-    return result
+    return parse_kline_csv(klines)

@@ -7,7 +7,7 @@
 3. 引用完整性（SKILL.md 提及的 scripts 路径全部存在）
 4. 策略注册表一致性（STRATEGY_REGISTRY 覆盖 S01-S17 共 17 种）
 5. Python 语法（scripts/ 下全部 .py 通过编译检查）
-6. 表面话术检查（无开发日志 / 版本历史痕迹，如"实测/旧实现/修复 2026/旧版本号"）
+6. 表述规范性检查（无开发日志 / 版本历史痕迹，如"实测/旧实现/修复 2026/旧版本号"）
 
 用法：python scripts/validate.py
 退出码：0=全部通过；1=存在未通过项。
@@ -54,7 +54,7 @@ def main() -> int:
     sys.path.insert(0, SCRIPTS)
     import config  # noqa: E402
     check(config.VERSION == fm.get("version"), f"config.VERSION({config.VERSION}) == frontmatter version({fm.get('version')})")
-    check(fm.get("version") == "1.0.3", "版本为 1.0.3")
+    check(fm.get("version") == config.VERSION, "frontmatter 版本与 config.VERSION 一致")
 
     print("== 3. 引用完整性（SKILL.md 提及的 scripts 路径）==")
     skill = open(SKILL, encoding="utf-8").read()
@@ -94,8 +94,8 @@ def main() -> int:
     if err == 0:
         check(True, f"全部 {len(py_files)} 个 .py 编译通过")
 
-    print("== 6. 表面话术检查 ==")
-    pattern = re.compile(r"实测|旧实现|旧逻辑|修复 2026|2026-08|v1\.0\.2|国泰海通|5\.31")
+    print("== 6. 表述规范性检查 ==")
+    pattern = re.compile(r"实测|旧实现|旧逻辑|修复 2026|2026-08|v1\.0\.[0-3]|dev\s+log")
     hits = []
     for root, _, files in os.walk(os.path.join(ROOT, "scripts")):
         if "__pycache__" in root:

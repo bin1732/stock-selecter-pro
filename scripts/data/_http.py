@@ -1,6 +1,5 @@
 """东财公开API 共享 HTTP 客户端（域名级故障切换 + 备选数据通道）。
 
-背景（真实网络调研）：
 - 部分网络环境下 push2.eastmoney.com（实时快照主节点）连接不可达，
   但东财官方备用延迟节点 push2delay.eastmoney.com 可达（约3分钟延迟）。
 - 两节点返回同一套公开字段（列表/行情/估值/资金流），语义一致，
@@ -81,7 +80,7 @@ http_get = _HttpClient().get
 PUSH2_HOSTS = ("push2.eastmoney.com", "push2delay.eastmoney.com")
 
 # 历史K线节点（push2his）：东财按线路部署多个编号节点，不同网络环境可达性不同，
-# 按序尝试，首个返回有效 data 的节点即用（真实网络调研：单一节点可能被限流/断开）
+# 按序尝试，首个返回有效 data 的节点即用（单一节点可能被限流/断开）
 PUSH2HIS_HOSTS = (
     "https://79.push2his.eastmoney.com",
     "https://92.push2his.eastmoney.com",
@@ -371,3 +370,31 @@ def safe_float(val, default: float = 0.0) -> float:
         return float(s)
     except (ValueError, TypeError):
         return default
+
+
+def parse_kline_csv(klines, include_turnover: bool = False) -> list[dict]:
+    """解析东财 K线 CSV 行（date/open/close/high/low/volume/amount/pct_chg[+turnover]）。
+
+    三市场（A股/港股/美股）K线接口返回同构 CSV 行（逗号分隔，至少 11 列，
+    列位：0日期/1开/2收/3高/4低/5量/6额/7振幅/8涨跌幅/9涨跌额/10换手率），
+    统一在此解析，避免三市场各自实现重复逻辑。
+    """
+    result = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 11:
+            continue
+        row = {
+            "date": parts[0],
+            "open": round(safe_float(parts[1]), 2),
+            "close": round(safe_float(parts[2]), 2),
+            "high": round(safe_float(parts[3]), 2),
+            "low": round(safe_float(parts[4]), 2),
+            "volume": int(safe_float(parts[5])),
+            "amount": round(safe_float(parts[6]), 2),
+            "pct_chg": safe_float(parts[8]),
+        }
+        if include_turnover:
+            row["turnover"] = safe_float(parts[10])
+        result.append(row)
+    return result

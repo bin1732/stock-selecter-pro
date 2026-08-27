@@ -53,6 +53,33 @@ from .us_share import (
     fetch_us_batch_klines,
 )
 
+
+def fetch_market_total(market: str) -> int:
+    """轻量查询某市场全市场股票总数（clist pz=1 的 total 字段，公开接口）。
+
+    用途：报告如实标注候选池覆盖率（候选数 / 全市场总数），仅 1 条请求，不引入额外依赖。
+
+    Returns:
+        int: 全市场股票总数；市场未知或接口失败时返回 0（如实未知）。
+    """
+    fs_map = {
+        "A股": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "港股": "m:128+t:3,m:128+t:4",
+        "美股": "m:105+t:3,m:105+t:4,m:105+t:5",
+    }
+    fs = fs_map.get(market)
+    if not fs:
+        return 0
+    from ._http import push2_get
+    data = push2_get("/api/qt/clist/get", params={
+        "pn": "1", "pz": "1", "po": "1", "np": "1",
+        "fltt": "2", "invt": "2", "fs": fs, "fields": "f12,f14",
+    })
+    if data:
+        return (data.get("data") or {}).get("total") or 0
+    return 0
+
+
 __all__ = [
     # A股
     "fetch_top_a_share_codes",
@@ -77,4 +104,6 @@ __all__ = [
     "fetch_all_us_codes",
     "fetch_us_daily_kline",
     "fetch_us_batch_klines",
+    # 聚合
+    "fetch_market_total",
 ]

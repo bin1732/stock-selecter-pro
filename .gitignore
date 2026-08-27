@@ -32,13 +32,10 @@ __pycache__/
 .Python
 *.so
 
-# Data cache
+# Data cache (runtime output dirs, root-level only)
+/output/
+/reports/
+/cache/
+/archive/
 *.sqlite
-*.db
-output/
-reports/
-cache/
-
-# Archive data
-archive/
 *.sqlite3

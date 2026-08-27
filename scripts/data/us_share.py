@@ -23,7 +23,7 @@ import time
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ._http import push2_get, kline_get, safe_float  # 东财共享客户端（故障切换+数值清洗）
+from ._http import push2_get, kline_get, safe_float, parse_kline_csv  # 东财共享客户端（故障切换+数值清洗）
 
 
 def fetch_all_us_codes() -> list[dict]:
@@ -46,7 +46,9 @@ def fetch_all_us_codes() -> list[dict]:
     """
     all_stocks = []
     page = 1
-    while True:
+    max_pages = 10  # 页数上限保护（防接口异常导致无限翻页）
+    empty_retries = 3  # 列表接口瞬时限流时整列表重试（连续空返回达到阈值才放弃）
+    while page <= max_pages:
         params = {
             "pn": str(page),
             "pz": "500",
@@ -64,9 +66,23 @@ def fetch_all_us_codes() -> list[dict]:
         if not data:
             break
 
-        items = data.get("data", {}).get("diff", [])
+        payload = data.get("data") or {}
+        items = payload.get("diff") or []
         if not items:
-            break
+            # 接口偶发限流（延迟节点对高频请求返回空）：等待后重试本页
+            # （clist 接口偶发数量波动，需重试兜底）
+            if page == 1:
+                for attempt in range(empty_retries):
+                    time.sleep(0.8 * (attempt + 1))
+                    data = push2_get("/api/qt/clist/get", params=params)
+                    if not data:
+                        continue
+                    payload = data.get("data") or {}
+                    items = payload.get("diff") or []
+                    if items:
+                        break
+            if not items:
+                break
 
         for item in items:
             code = item.get("f12", "")
@@ -82,9 +98,13 @@ def fetch_all_us_codes() -> list[dict]:
                     "dividend_yield": safe_float(item.get("f133")),
                 })
 
-        # 分页终止：以当页返回条数判断（不足一页即最后一页），
-        # 避免用累计数与 total 比较导致提前终止
-        if len(items) < 500:
+        # 分页终止：优先按接口返回的 total 判断（延迟节点每页可能仅返回 100 条，
+        # 若按"当页不足整页"判断会提前截断候选池，漏掉市值靠后的标的）；
+        # 接口未返回 total 时才按"当页不足整页"兜底判末页
+        total = payload.get("total") or 0
+        if total and len(all_stocks) >= total:
+            break
+        if not total and len(items) < 500:
             break
         page += 1
 
@@ -123,23 +143,7 @@ def fetch_us_daily_kline(code: str, days: int = 120) -> list[dict]:
     klines = data.get("data", {}).get("klines", [])
     if not klines:
         return []
-
-    result = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) < 11:
-            continue
-        result.append({
-            "date": parts[0],
-            "open": round(safe_float(parts[1]), 2),
-            "close": round(safe_float(parts[2]), 2),
-            "high": round(safe_float(parts[3]), 2),
-            "low": round(safe_float(parts[4]), 2),
-            "volume": int(safe_float(parts[5])),
-            "amount": round(safe_float(parts[6]), 2),
-            "pct_chg": safe_float(parts[8]),
-        })
-    return result
+    return parse_kline_csv(klines)
 
 
 def fetch_us_batch_klines(

@@ -17,6 +17,14 @@ import urllib.error
 from typing import Optional
 
 from ._http import http_get, push2_get, safe_float  # 东财共享客户端（标准库实现，主/备节点故障切换+数值清洗）
+from cache import KlineCacheManager  # 复用K线缓存管理器（内存+文件双层、次日15:30过期机制）
+
+# 结果级缓存（财务摘要/估值）：与K线同策略——写入后至"下一个自然日 15:30"前有效。
+# 合理性：财务摘要本身滞后1-4个月（当日刷新无意义）；估值走官方延迟节点（约3分钟延迟），
+# 当日缓存对选股场景足够；重复提问（同参数同市场）直接命中缓存，显著减少网络往返与耗时。
+# 真实约束：仅缓存**含真实数据**的结果（字段非全 None），网络失败的降级结果不缓存，下次重试。
+_RESULT_CACHE = KlineCacheManager()
+
 
 # 估值接口 secid 前缀（push2 stock/get 对三市场均返回 PE/PB/股息率等估值字段）
 # - A股: 1.沪 / 0.深（按代码首位动态）
@@ -42,6 +50,11 @@ def _secid_for_valuation(code: str, market: str = "A股") -> str:
 # 财务摘要接口：东方财富数据中心公开报表（公开报表，字段语义已交叉验证）
 FINANCE_API_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 FINANCE_REPORT_NAME = "RPT_F10_FINANCE_MAINFINADATA"
+# 港股/美股财务摘要：东财数据中心 GMAININDICATOR 关键财务指标报表（公开数据）
+# - 港股 RPT_HKF10_FN_GMAININDICATOR（75 字段，含 ROE_AVG/每股经营现金流等）
+# - 美股 RPT_USF10_FN_GMAININDICATOR（49 字段，含 ROE_AVG/毛利率/资产负债率等）
+HK_FINANCE_REPORT_NAME = "RPT_HKF10_FN_GMAININDICATOR"
+US_FINANCE_REPORT_NAME = "RPT_USF10_FN_GMAININDICATOR"
 
 
 def _to_secucode(code: str) -> str:
@@ -52,6 +65,19 @@ def _to_secucode(code: str) -> str:
     if code.startswith(("4", "8")):
         return f"{code}.BJ"
     return f"{code}.SZ"
+
+
+def _to_hk_us_secucode(code: str, market: str) -> str:
+    """港股/美股代码 → 东财 SECUCODE。
+
+    - 港股：5位补零 + .HK（00700 → 00700.HK）
+    - 美股：优先 NASDAQ 后缀 .O（AAPL → AAPL.O）；NYSE 标的需 .N
+      （BABA → BABA.N），调用方对 .O 空结果回退 .N。
+    """
+    code = str(code).strip()
+    if market == "港股":
+        return f"{code.zfill(5)}.HK"
+    return f"{code}.O"
 
 
 def _num(v):
@@ -67,7 +93,7 @@ def _num(v):
     return safe_float(v)
 
 
-def fetch_financial_summary(code: str) -> dict:
+def fetch_financial_summary(code: str, use_cache: bool = True) -> dict:
     """获取个股财务摘要。
 
     来源：东方财富数据中心公开报表 RPT_F10_FINANCE_MAINFINADATA（最新报告期）。
@@ -78,7 +104,14 @@ def fetch_financial_summary(code: str) -> dict:
     Returns:
         dict: 含 roe/per_eps/profit_gross/net_profit_rate/debt_ratio 等字段；
         接口失败或字段缺失时如实置 None，不伪造数据。
+
+    结果级缓存：同市场同代码当日有效（次日15:30过期，与K线缓存一致），
+    仅缓存含真实数据的 result（全 None 的失败结果不缓存，下次重试）。
     """
+    cached = _RESULT_CACHE.get(f"fin:A:{code}", 1) if use_cache else None
+    if cached is not None:
+        return cached
+
     result = {
         "code": code,
         "roe": None,               # 净资产收益率(%)
@@ -89,6 +122,7 @@ def fetch_financial_summary(code: str) -> dict:
         "revenue_growth": None,     # 营收同比(%)
         "net_profit_growth": None,  # 净利润同比(%)
         "operating_cfps": None,     # 每股经营现金流
+        "report_date": None,        # 报告期日期（YYYY-MM-DD，用于如实标注财务数据滞后）
     }
 
     try:
@@ -119,13 +153,112 @@ def fetch_financial_summary(code: str) -> dict:
         result["revenue_growth"] = _num(latest.get("TOTALOPERATEREVETZ"))
         result["net_profit_growth"] = _num(latest.get("PARENTNETPROFITTZ"))
         result["operating_cfps"] = _num(latest.get("MGJYXJJE"))
+        rd = latest.get("REPORT_DATE")
+        if rd:
+            result["report_date"] = str(rd)[:10]  # 报告期日期（如实标注数据滞后）
     except (urllib.error.URLError, OSError, ValueError, KeyError):
         pass  # 网络/解析失败时如实返回全 None 默认值，不伪造数据
 
+    if use_cache and any(v is not None for k, v in result.items() if k != "code"):
+        _RESULT_CACHE.set(f"fin:A:{code}", 1, result)
     return result
 
 
-def fetch_valuation(code: str, market: str = "A股") -> dict:
+def fetch_hk_us_financial_summary(code: str, market: str, use_cache: bool = True) -> dict:
+    """获取港股/美股个股财务摘要。
+
+    来源：东方财富数据中心公开报表 GMAININDICATOR 关键财务指标（最新报告期）。
+    - 港股 RPT_HKF10_FN_GMAININDICATOR：75 字段，含 ROE_AVG/每股经营现金流等
+    - 美股 RPT_USF10_FN_GMAININDICATOR：49 字段，含 ROE_AVG/毛利率/资产负债率等；
+      美股无"每股经营现金流"字段（PER_NETCASH_OPERATE），operating_cfps 如实 None
+
+    字段映射（真实字段名，与 A股 fetch_financial_summary 输出同构）：
+    ROE_AVG→roe、BASIC_EPS→per_eps、GROSS_PROFIT_RATIO→profit_gross、
+    NET_PROFIT_RATIO→net_profit_rate、DEBT_ASSET_RATIO→debt_ratio、
+    OPERATE_INCOME_YOY→revenue_growth、
+    港股 HOLDER_PROFIT_YOY / 美股 PARENT_HOLDER_NETPROFIT_YOY→net_profit_growth、
+    港股 PER_NETCASH_OPERATE→operating_cfps（美股无此字段，如实 None）。
+
+    Returns:
+        dict: 与 fetch_financial_summary 同构；接口失败或字段缺失时如实置 None，不伪造。
+
+    结果级缓存：同市场同代码当日有效（次日15:30过期，与K线缓存一致），
+    仅缓存含真实数据的 result（全 None 的失败结果不缓存，下次重试）。
+    """
+    cached = _RESULT_CACHE.get(f"fin:{market}:{code}", 1) if use_cache else None
+    if cached is not None:
+        return cached
+
+    result = {
+        "code": code,
+        "roe": None,
+        "per_eps": None,
+        "profit_gross": None,
+        "net_profit_rate": None,
+        "debt_ratio": None,
+        "revenue_growth": None,
+        "net_profit_growth": None,
+        "operating_cfps": None,
+        "report_date": None,  # 报告期日期（用于如实标注财务数据滞后）
+    }
+
+    report_name = HK_FINANCE_REPORT_NAME if market == "港股" else US_FINANCE_REPORT_NAME
+    secucode = _to_hk_us_secucode(code, market)
+
+    def _query(secu: str):
+        try:
+            resp = http_get(
+                FINANCE_API_URL,
+                params={
+                    "reportName": report_name,
+                    "columns": "ALL",
+                    "filter": f'(SECUCODE="{secu}")',
+                    "pageNumber": "1",
+                    "pageSize": "1",
+                    "sortColumns": "REPORT_DATE",
+                    "sortTypes": "-1",
+                    "source": "WEB",
+                    "client": "WEB",
+                },
+                timeout=8,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            return (payload.get("result") or {}).get("data") or []
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            return []
+
+    rows = _query(secucode)
+    if not rows and market == "美股":
+        # 美股 NASDAQ(.O) 无数据时回退 NYSE(.N)（BABA.N 等纽交所标的）
+        rows = _query(f"{code.strip()}.N")
+    if not rows:
+        return result
+
+    latest = rows[0]
+    result["roe"] = _num(latest.get("ROE_AVG"))
+    result["per_eps"] = _num(latest.get("BASIC_EPS"))
+    result["profit_gross"] = _num(latest.get("GROSS_PROFIT_RATIO"))
+    result["net_profit_rate"] = _num(latest.get("NET_PROFIT_RATIO"))
+    result["debt_ratio"] = _num(latest.get("DEBT_ASSET_RATIO"))
+    result["revenue_growth"] = _num(latest.get("OPERATE_INCOME_YOY"))
+    if market == "港股":
+        result["net_profit_growth"] = _num(latest.get("HOLDER_PROFIT_YOY"))
+        result["operating_cfps"] = _num(latest.get("PER_NETCASH_OPERATE"))
+    else:
+        result["net_profit_growth"] = _num(latest.get("PARENT_HOLDER_NETPROFIT_YOY"))
+        # 美股无每股经营现金流字段（GMAININDICATOR 49 字段），如实 None
+        result["operating_cfps"] = None
+    rd = latest.get("REPORT_DATE")
+    if rd:
+        result["report_date"] = str(rd)[:10]  # 报告期日期（如实标注数据滞后）
+
+    if use_cache and any(v is not None for k, v in result.items() if k != "code"):
+        _RESULT_CACHE.set(f"fin:{market}:{code}", 1, result)
+    return result
+
+
+def fetch_valuation(code: str, market: str = "A股", use_cache: bool = True) -> dict:
     """获取个股估值指标（支持 A股/港股/美股；单只/回退场景用）。
 
     注意：push2 stock/get 的 f171 字段**不是可靠股息率**（三市场均不可靠）。
@@ -134,7 +267,14 @@ def fetch_valuation(code: str, market: str = "A股") -> dict:
 
     Returns:
         dict: 含 pe/pb/ps/total_mv 等字段；dividend_yield 恒为 None（无可靠单只来源）
+
+    结果级缓存：同市场同代码当日有效（次日15:30过期，与K线缓存一致），
+    仅缓存含真实数据的 result（全 None 的失败结果不缓存，下次重试）。
     """
+    cached = _RESULT_CACHE.get(f"val:{market}:{code}", 1) if use_cache else None
+    if cached is not None:
+        return cached
+
     result = {
         "code": code,
         "pe_ttm": None,        # 市盈率(TTM)
@@ -175,6 +315,8 @@ def fetch_valuation(code: str, market: str = "A股") -> dict:
     except (urllib.error.URLError, OSError, ValueError, KeyError):
         pass  # 网络/解析失败时如实返回全 None 默认值，不伪造数据
 
+    if use_cache and any(v is not None for k, v in result.items() if k != "code"):
+        _RESULT_CACHE.set(f"val:{market}:{code}", 1, result)
     return result
 
 
@@ -185,6 +327,7 @@ def fetch_fundamental_batch(
     need_financial: bool = True,
     need_valuation: bool = True,
     pool_valuation: Optional[dict] = None,
+    use_cache: bool = True,
 ) -> dict[str, dict]:
     """批量获取多只股票基本面+估值数据（按策略依赖裁剪，减少无谓请求）。
 
@@ -193,11 +336,12 @@ def fetch_fundamental_batch(
         market: 市场（A股/港股/美股），决定估值 secid 前缀；港股/美股无公开财务摘要数据源，
             仅获取估值指标（如实缺省财务字段）
         max_workers: 并发线程数
-        need_financial: 是否获取财务摘要（仅 A股；S12/S13/S14 依赖）
+        need_financial: 是否获取财务摘要（S12/S13/S14 依赖）
         need_valuation: 是否获取估值指标（S06/S07 依赖；三市场可用）
         pool_valuation: 候选池估值字典 code -> {pe_ttm, pb, dividend_yield, ...}
             （主流程优先使用候选池 clist 字段 f9/f23/f133——三市场可靠，
             替代逐只 push2 stock/get 请求以提速；仅候选池缺失的标的回退逐只请求）
+        use_cache: 是否使用结果级缓存（--no-cache 时 False）
 
     Returns:
         dict[str, dict]: code -> {**financial_summary, **valuation}
@@ -208,15 +352,20 @@ def fetch_fundamental_batch(
 
     def _fetch_one(code: str):
         merged = {"code": code}
-        if market == "A股" and need_financial:
-            # 财务摘要接口（emweb PC_HSF10）仅覆盖A股
-            merged.update(fetch_financial_summary(code))
+        if need_financial:
+            if market == "A股":
+                # A股财务摘要接口（PC_HSF10 数据中心报表）
+                merged.update(fetch_financial_summary(code, use_cache=use_cache))
+            else:
+                # 港股/美股财务摘要（GMAININDICATOR 报表，三市场字段同构，
+                # 港股 75 字段含 ROE/现金流，美股 49 字段含 ROE/毛利率等）
+                merged.update(fetch_hk_us_financial_summary(code, market, use_cache=use_cache))
         if need_valuation:
             if pool_valuation and code in pool_valuation:
                 # 候选池 clist 估值（真实字段，优先）；财务摘要照常拉取
                 merged.update(pool_valuation[code])
             else:
-                val = fetch_valuation(code, market=market)
+                val = fetch_valuation(code, market=market, use_cache=use_cache)
                 merged.update(val)
         merged["code"] = code
         return code, merged

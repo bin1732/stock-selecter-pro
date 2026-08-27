@@ -88,6 +88,21 @@ def check_s12_cashflow_quality(
     else:
         details["roe"] = None
 
+    # ── 现金流条件：每股经营现金流为正（基本面，来自财务摘要 operating_cfps） ──
+    cfps_pass = False
+    cfps = None
+    if fundamental:
+        cfps = fundamental.get("operating_cfps")
+    if cfps is not None:
+        details["operating_cfps"] = cfps
+        if cfps > 0:
+            cfps_pass = True
+            reasons.append(f"每股经营现金流 {cfps:.2f} 为正，经营造血能力正常")
+        else:
+            reasons.append(f"每股经营现金流 {cfps:.2f} 非正，经营造血偏弱")
+    else:
+        details["operating_cfps"] = None
+
     # ── 条件二：净利率合理（基本面） ──
     npr_pass = False
     if net_profit_rate is not None:
@@ -138,6 +153,7 @@ def check_s12_cashflow_quality(
 
     details["conditions"] = {
         "roe_pass": roe_pass,
+        "cfps_pass": cfps_pass,
         "npr_pass": npr_pass,
         "debt_pass": debt_pass,
         "tech_pass": tech_pass,
@@ -145,11 +161,13 @@ def check_s12_cashflow_quality(
     }
 
     if roe_pass:
-        score += 0.35
-    if npr_pass:
-        score += 0.2
-    if debt_pass:
+        score += 0.3
+    if cfps_pass:
         score += 0.15
+    if npr_pass:
+        score += 0.15
+    if debt_pass:
+        score += 0.1
     if tech_pass:
         score += 0.15
     if yang_count >= S12_YANG_DAYS_MIN:

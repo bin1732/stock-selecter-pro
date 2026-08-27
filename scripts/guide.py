@@ -1,5 +1,5 @@
 """
-stock-selecter-pro v1.0.3 新用户交互式引导向导 (Interactive Guide)
+stock-selecter-pro v1.0.4 新用户交互式引导向导 (Interactive Guide)
 
 设计理念：
 - 不强制用户从某一步开始，允许从任意环节切入
@@ -450,9 +450,11 @@ def _step_market_select():
     print("  当前选择: " + _c(_session_state["market"], "cyan"))
     print()
     print("  输入选择: [1] A股  [2] 港股  [3] 美股  [4] 全部  [Enter] 保持不变")
+    print("           也可以直接输入市场名（如 港股 / 美股 / 全选 / all），s 跳过本步，b 返回上一步")
     print()
-    print("  提示: v1.0.3 主流程已支持 A股/港股/美股 三市场执行；")
-    print("        港股/美股 无基本面/资金流公开数据，对应策略将自动不通过（真实缺数据）。")
+    print("  提示: v1.0.4 主流程支持 A股/港股/美股 三市场全功能执行；")
+    print("        估值/财务/技术面策略三市场真实可用（港股/美股财务摘要走东财数据中心 GMAININDICATOR 报表）；")
+    print("        S15 在美股的资金流辅助条件不可用（无对应公开口径），技术面核心条件仍如实判定。")
     print()
 
     return markets_info
@@ -546,20 +548,15 @@ def _step_strategy_recommend():
             ("S01", "红肥绿瘦", "主力吸筹迹象"),
         ]
 
-    # 市场能力边界：港股/美股缺财务摘要公开数据，S12/S13/S14 自动不通过，从推荐中移除；
-    # S15 为技术面核心（长期低位+横盘蓄力），资金流仅辅助加分，无资金流时仍如实判定、可独立通过
+    # 市场能力边界（如实）：估值/财务/技术面策略三市场真实可用
+    # （港股/美股财务摘要走 GMAININDICATOR 报表，真实返回）；
+    # S15 在美股的资金流辅助条件不可用（美股无对应公开口径），技术面核心条件仍如实判定、可独立通过
     if _session_state.get("market") in (config.MARKET_HK, config.MARKET_US):
-        removed = sorted({sid for sid, _, _ in recommendations
-                          if sid in config.FINANCIAL_STRATEGIES})
-        if removed:
-            print(_c(
-                f"  提示: 港股/美股无财务摘要公开数据，"
-                f"已从推荐中移除 {', '.join(removed)}。"
-                f"S15 的资金流辅助条件不可用，技术面核心条件仍如实判定。",
-                "yellow",
-            ))
-        recommendations = [r for r in recommendations
-                           if r[0] not in config.FINANCIAL_STRATEGIES]
+        print(_c(
+            "  提示: 估值/财务/技术面策略在该市场真实可用（财务摘要走东财数据中心 GMAININDICATOR 报表）；"
+            "S15 在美股的资金流辅助条件不可用，技术面核心条件仍如实判定。",
+            "yellow",
+        ))
 
     print(f"  {'策略ID':8s} {'策略名':14s} {'匹配理由'}")
     print("  " + "-" * 55)
@@ -568,7 +565,7 @@ def _step_strategy_recommend():
     print("  " + "-" * 55)
     print()
     if _session_state.get("market") in (config.MARKET_HK, config.MARKET_US):
-        print("  港股/美股可用策略 14 种（财务摘要类 S12/S13/S14 自动不通过），当前默认启用全部。")
+        print("  港股/美股可用策略 17 种（估值/财务/技术面均真实可用；S15 在美股的资金流辅助不可用，技术面核心可独立通过），当前默认启用全部。")
     else:
         print("  总计 17 种策略均可用，当前默认启用全部。")
     print(f"  可通过 --strategies 参数指定：如 --strategies {','.join([r[0] for r in recommendations[:3]])}")
@@ -795,6 +792,21 @@ def _handle_step_input(step_name: str, input_str: str) -> str:
             _session_state["market"] = market_map[input_str]
             print(_c(f"  已选择: {_session_state['market']}", "green"))
             return "next"
+        # 人性化自由输入：直接输入市场名/别名，不强制编号（用户明确需求时灵活应变）
+        alias_map = {
+            "a股": "A股", "a": "A股", "沪深": "A股", "沪深京": "A股", "国内": "A股",
+            "港股": "港股", "hk": "港股", "港": "港股", "hongkong": "港股",
+            "美股": "美股", "us": "美股", "美": "美股", "usa": "美股",
+            "全部": "全部", "全选": "全部", "all": "全部", "都": "全部",
+            "三个市场": "全部", "三市场": "全部", "所有市场": "全部",
+        }
+        norm = input_str.strip().lower().replace(" ", "")
+        if norm in alias_map:
+            _session_state["market"] = alias_map[norm]
+            print(_c(f"  已选择: {_session_state['market']}", "green"))
+            return "next"
+        print(_c(f"  无法识别: {input_str}（可用: 1=A股 2=港股 3=美股 4=全部，或直接输入市场名）", "yellow"))
+        return "stay"
 
     elif step_name == "strategy_recommend":
         if input_str:
@@ -812,39 +824,51 @@ def _handle_step_input(step_name: str, input_str: str) -> str:
 
     elif step_name == "param_config":
         parts = input_str.split()
-        if len(parts) >= 2:
-            try:
-                param_id = int(parts[0])
-                if param_id == 1:
-                    fmt = parts[1].lower()
-                    if fmt in ("text", "json", "html", "all"):
-                        _session_state["output_format"] = fmt
-                        print(_c(f"  输出格式 → {fmt}", "green"))
-                        return "next"
-                    print(_c(f"  无效格式: {fmt}", "red"))
-                elif param_id == 2:
-                    _session_state["top_n"] = int(parts[1])
-                    print(_c(f"  TOP-N → {_session_state['top_n']}", "green"))
+        if not parts:
+            return "stay"
+        try:
+            param_id = int(parts[0])
+        except ValueError:
+            print(_c("  输入格式错误", "red"))
+            return "stay"
+        # 开关型参数（4 多周期 / 5 缓存）单个编号即可切换
+        if param_id == 4:
+            _session_state["multi_period"] = not _session_state["multi_period"]
+            s = "开" if _session_state["multi_period"] else "关"
+            print(_c(f"  多周期验证 → {s}", "green"))
+            return "next"
+        if param_id == 5:
+            _session_state["no_cache"] = not _session_state["no_cache"]
+            s = "关" if _session_state["no_cache"] else "开"
+            print(_c(f"  缓存 → {s}", "green"))
+            return "next"
+        # 取值型参数（1 格式 / 2 TOP-N / 3 组合模式）需要 编号+值
+        if len(parts) < 2:
+            print(_c("  该参数需要附带取值，如 '2 30'", "yellow"))
+            return "stay"
+        try:
+            if param_id == 1:
+                fmt = parts[1].lower()
+                if fmt in ("text", "json", "html", "all"):
+                    _session_state["output_format"] = fmt
+                    print(_c(f"  输出格式 → {fmt}", "green"))
                     return "next"
-                elif param_id == 3:
-                    mode = parts[1].lower()
-                    if mode in ("union", "intersection", "weighted"):
-                        _session_state["strategy_mode"] = mode
-                        print(_c(f"  组合模式 → {mode}", "green"))
-                        return "next"
-                    print(_c(f"  无效组合模式: {mode}", "red"))
-                elif param_id == 4:
-                    _session_state["multi_period"] = not _session_state["multi_period"]
-                    s = "开" if _session_state["multi_period"] else "关"
-                    print(_c(f"  多周期验证 → {s}", "green"))
+                print(_c(f"  无效格式: {fmt}", "red"))
+            elif param_id == 2:
+                _session_state["top_n"] = int(parts[1])
+                print(_c(f"  TOP-N → {_session_state['top_n']}", "green"))
+                return "next"
+            elif param_id == 3:
+                mode = parts[1].lower()
+                if mode in ("union", "intersection", "weighted"):
+                    _session_state["strategy_mode"] = mode
+                    print(_c(f"  组合模式 → {mode}", "green"))
                     return "next"
-                elif param_id == 5:
-                    _session_state["no_cache"] = not _session_state["no_cache"]
-                    s = "关" if _session_state["no_cache"] else "开"
-                    print(_c(f"  缓存 → {s}", "green"))
-                    return "next"
-            except ValueError:
-                print(_c("  输入格式错误", "red"))
+                print(_c(f"  无效组合模式: {mode}", "red"))
+            else:
+                print(_c(f"  无效配置编号: {param_id}", "red"))
+        except ValueError:
+            print(_c("  输入格式错误", "red"))
         return "stay"
 
     elif step_name == "exec_confirm":
@@ -1045,7 +1069,7 @@ def main():
     parser.add_argument("--step", default=None,
                         choices=STEPS,
                         help="直接跳转到指定步骤")
-    # 预填参数（修复：旧版独立 CLI 仅支持 --step，无法预填市场等配置）
+    # 预填参数（支持 CLI 预填市场等配置）
     parser.add_argument("--market", default=None,
                         help="预填目标市场: A股/港股/美股/全部")
     parser.add_argument("--mode", default=None,

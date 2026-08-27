@@ -170,7 +170,7 @@ def _evaluate(
 
     elif mode == "union":
         passed = hit_count > 0
-        score = min(hit_count, total) / total * 10.0 if total > 0 else 0
+        score = hit_count / total * 10.0 if total > 0 else 0
         details.append(f"并集模式: {'通过' if passed else '未通过'} (命中{hit_count}个)")
 
     else:  # weighted
